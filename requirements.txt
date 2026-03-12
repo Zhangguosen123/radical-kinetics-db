@@ -1,7 +1,7 @@
-# 核心依赖（锁定兼容版本）
-streamlit>=1.28.0,<1.56.0
-numpy>=1.26.0,<2.0.0
-pandas>=2.1.0,<3.0.0
+# 核心依赖（兼容Python 3.12）
+streamlit>=1.30.0,<1.50.0
+numpy>=1.24.0,<1.27.0
+pandas>=2.0.0,<2.2.0
 
-# RDKit 兼容方案（适配 Python 3.14）
-rdkit-pypi==2024.3.2
+# RDKit（Python 3.12 唯一可用版本）
+rdkit-pypi==2023.9.6
