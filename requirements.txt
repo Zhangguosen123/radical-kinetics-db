@@ -1,7 +1,9 @@
-# 核心依赖（兼容Python 3.12）
-streamlit>=1.30.0,<1.50.0
-numpy>=1.24.0,<1.27.0
-pandas>=2.0.0,<2.2.0
+# 核心依赖库（仅保留代码中实际使用的）
+streamlit>=1.30.0,<2.0.0
+numpy==1.26.4  # 锁定1.x系列稳定版，避免自动升级到2.0+实验版
+pandas>=2.2.0   # 升级到支持Python 3.14的版本
+matplotlib>=3.7.0
+scikit-learn>=1.2.0
 
-# RDKit（Python 3.12 唯一可用版本）
-rdkit-pypi==2023.9.6
+# 🔴 临时注释掉 RDKit（Python 3.14 下无可用版本）
+# rdkit-pypi==2023.9.6
