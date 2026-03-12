@@ -1,0 +1,14 @@
+# 核心依赖
+streamlit>=1.30.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# RDKit（分子计算核心）
+rdkit-pypi>=2023.9.5
+
+# 移除以下错误声明（这些是Python内置模块，无需安装）
+# python>=3.9.0
+# os-sys>=2.0.1
+# re>=2.2.1
+# sqlite3>=2.6.0
+# warnings>=0.1
