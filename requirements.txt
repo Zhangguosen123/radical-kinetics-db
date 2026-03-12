@@ -1,7 +1,10 @@
-# 核心依赖
-streamlit>=1.30.0,<1.50.0
-numpy>=1.24.0,<1.27.0
-pandas>=2.0.0,<2.2.0
+# 强制使用兼容 Python 3.12 的稳定版本
+streamlit==1.49.0
+numpy==1.26.4
+pandas==2.1.4
 
-# RDKit（Python 3.12 唯一稳定版本）
+# RDKit 专用版本（Python 3.12 唯一可用版）
 rdkit-pypi==2023.9.6
+
+# 其他依赖
+rich>=10.14.0
