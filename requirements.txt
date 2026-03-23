@@ -3,3 +3,4 @@ numpy==1.26.4
 pandas==2.2.3
 rdkit
 rich>=10.14.0
+psycopg[binary]>=3.2
