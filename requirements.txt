@@ -1,12 +1,5 @@
-# 核心依赖（适配 Python 3.14）
 streamlit==1.49.0
 numpy==1.26.4
-pandas==2.2.3  # 2.2.x 对 Python 3.14 兼容性最好
-
-# RDKit 源码编译依赖（必须按这个顺序）
-cmake>=3.20.0
-cython>=0.29.37
-rdkit  # 不指定版本，让 pip 自动找兼容源码编译的版本
-
-# 其他依赖
+pandas==2.2.3
+rdkit
 rich>=10.14.0
