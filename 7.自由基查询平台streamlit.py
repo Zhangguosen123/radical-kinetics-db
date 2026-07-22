@@ -1,6 +1,7 @@
 import os
 import re
 import warnings
+from html import escape
 
 import numpy as np
 import pandas as pd
@@ -11,10 +12,11 @@ warnings.filterwarnings("ignore")
 
 # ===================== RDKit imports =====================
 try:
-    from rdkit import Chem
+    from rdkit import Chem, DataStructs
     from rdkit.Chem import Descriptors, Lipinski, rdMolDescriptors
     from rdkit.Chem import MACCSkeys
     from rdkit.Chem import Draw
+    from rdkit.Chem import rdFingerprintGenerator
 except ImportError as e:
     st.error(f"RDKit import failed: {e}")
     st.error("Please check dependencies and deploy with Python 3.12.")
@@ -161,7 +163,7 @@ RADICAL_FILES = {
     "Free chlorine (HOCl/OCl−)": "FreeChlorine_ultimate.csv",
     "Chlorine radical (Cl•)": "ChlorineRadical_ultimate.csv",
     "Dichlorine radical (Cl2•−)": "DichlorineRadical_ultimate.csv",
-    "Singlet Oxygen (1O2)": "SingletOxygen_ultimate.csv"
+    "Singlet Oxygen (1O2)": "SingletOxygen_ultimate.csv",
 }
 REQUIRED_COLS = ["Chemical compound", "Cas", "Smiles", "Logk", "Chemical_class_27", "Ph", "T", "Ref"]
 
@@ -172,77 +174,124 @@ def get_dev_key() -> str:
     except Exception:
         return os.environ.get("RADLOGK_DEV_KEY", "")
 
-def get_postgres_conninfo() -> dict:
-    if "postgres" not in st.secrets:
-        raise RuntimeError("Postgres secrets not configured in Streamlit Secrets.")
-    pg = st.secrets["postgres"]
-    return {
-        "host": pg["host"],
-        "port": int(pg.get("port", 5432)),
-        "dbname": pg["dbname"],
-        "user": pg["user"],
-        "password": pg["password"],
-        "sslmode": pg.get("sslmode", "require"),
-    }
 
-@st.cache_resource
-def get_db_connection():
+def get_postgres_conninfo() -> dict:
+    try:
+        pg = st.secrets["postgres"]
+        return {
+            "host": pg["host"],
+            "port": int(pg.get("port", 5432)),
+            "dbname": pg["dbname"],
+            "user": pg["user"],
+            "password": pg["password"],
+            "sslmode": pg.get("sslmode", "require"),
+            "connect_timeout": int(pg.get("connect_timeout", 10)),
+        }
+    except Exception:
+        env_conninfo = {
+            "host": os.environ.get("POSTGRES_HOST", ""),
+            "port": int(os.environ.get("POSTGRES_PORT", "5432")),
+            "dbname": os.environ.get("POSTGRES_DBNAME", ""),
+            "user": os.environ.get("POSTGRES_USER", ""),
+            "password": os.environ.get("POSTGRES_PASSWORD", ""),
+            "sslmode": os.environ.get("POSTGRES_SSLMODE", "require"),
+            "connect_timeout": int(os.environ.get("POSTGRES_CONNECT_TIMEOUT", "10")),
+        }
+        missing = [k for k in ["host", "dbname", "user", "password"] if not env_conninfo[k]]
+        if missing:
+            raise RuntimeError("Postgres secrets not configured in Streamlit Secrets.")
+        return env_conninfo
+
+
+def with_db_connection(operation):
     conninfo = get_postgres_conninfo()
-    return psycopg.connect(**conninfo)
+    last_error = None
+
+    for _ in range(2):
+        try:
+            with psycopg.connect(**conninfo) as conn:
+                result = operation(conn)
+                conn.commit()
+                return result
+        except Exception as e:
+            last_error = e
+
+    raise last_error
+
 
 def db_init():
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS app_metrics (
-                metric_key TEXT PRIMARY KEY,
-                metric_value BIGINT NOT NULL DEFAULT 0
-            )
-        """)
-        cur.execute("""
-            INSERT INTO app_metrics (metric_key, metric_value)
-            VALUES
-                ('visits', 0),
-                ('queries', 0),
-                ('downloads', 0)
-            ON CONFLICT (metric_key) DO NOTHING
-        """)
-    conn.commit()
+    def operation(conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_metrics (
+                    metric_key TEXT PRIMARY KEY,
+                    metric_value BIGINT NOT NULL DEFAULT 0
+                )
+            """)
+            cur.execute("""
+                INSERT INTO app_metrics (metric_key, metric_value)
+                VALUES
+                    ('visits', 0),
+                    ('queries', 0),
+                    ('downloads', 0)
+                ON CONFLICT (metric_key) DO NOTHING
+            """)
+
+    with_db_connection(operation)
+
 
 def db_get_all_metrics() -> dict:
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT metric_key, metric_value FROM app_metrics")
-        rows = cur.fetchall()
-    out = {"visits": 0, "queries": 0, "downloads": 0}
-    for k, v in rows:
-        out[str(k)] = int(v)
-    return out
+    def operation(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT metric_key, metric_value FROM app_metrics")
+            rows = cur.fetchall()
+
+        out = {"visits": 0, "queries": 0, "downloads": 0}
+        for k, v in rows:
+            out[str(k)] = int(v)
+        return out
+
+    return with_db_connection(operation)
+
 
 def db_inc_metric(metric_key: str, n: int = 1):
-    conn = get_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO app_metrics (metric_key, metric_value)
-            VALUES (%s, %s)
-            ON CONFLICT (metric_key)
-            DO UPDATE SET metric_value = app_metrics.metric_value + EXCLUDED.metric_value
-        """, (metric_key, int(n)))
-    conn.commit()
+    def operation(conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO app_metrics (metric_key, metric_value)
+                VALUES (%s, %s)
+                ON CONFLICT (metric_key)
+                DO UPDATE SET metric_value = app_metrics.metric_value + EXCLUDED.metric_value
+            """, (metric_key, int(n)))
+
+    with_db_connection(operation)
+
 
 # ===================== Persistent metrics init =====================
-try:
-    db_init()
-except Exception as e:
-    st.error(f"Database initialization failed: {e}")
-    st.stop()
+if "metrics_available" not in st.session_state:
+    try:
+        db_init()
+        st.session_state["metrics_available"] = True
+        st.session_state["metrics_db_error"] = ""
+    except Exception as e:
+        st.session_state["metrics_available"] = False
+        st.session_state["metrics_db_error"] = str(e)
+
+if not st.session_state.get("metrics_available", False):
+    st.warning(
+        "Metrics database is currently unavailable, so visit/query/download counters are disabled. "
+        f"Main search remains available. Detail: {st.session_state.get('metrics_db_error', '')}"
+    )
 
 if "visit_counted" not in st.session_state:
     st.session_state["visit_counted"] = True
-    try:
-        db_inc_metric("visits", 1)
-    except Exception as e:
-        st.warning(f"Visit counter update failed: {e}")
+    if st.session_state.get("metrics_available", False):
+        try:
+            db_inc_metric("visits", 1)
+        except Exception as e:
+            st.session_state["metrics_available"] = False
+            st.session_state["metrics_db_error"] = str(e)
+            st.warning(f"Visit counter update failed: {e}")
 
 if "calc_cache" not in st.session_state:
     st.session_state["calc_cache"] = {}
@@ -267,6 +316,7 @@ def get_query_params():
         except Exception:
             return {}
 
+
 def qp_has_dev_flag() -> bool:
     qp = get_query_params()
     v = None
@@ -276,7 +326,12 @@ def qp_has_dev_flag() -> bool:
             v = v[0]
     return str(v).strip().lower() in ["1", "true", "yes", "on"]
 
+
 # ===================== Utils =====================
+def h(x) -> str:
+    return escape(str(x), quote=True)
+
+
 def norm_text(x: str) -> str:
     if x is None:
         return ""
@@ -284,12 +339,15 @@ def norm_text(x: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.lower()
 
+
 def safe_str_series(s: pd.Series) -> pd.Series:
     return s.astype(str).fillna("").map(lambda x: x.strip()).replace({"nan": "", "NaN": ""})
+
 
 def is_cas_like(s: str) -> bool:
     s = (s or "").strip()
     return bool(re.match(r"^\d{2,7}-\d{2}-\d$", s))
+
 
 def calc_k_from_logk(x):
     try:
@@ -304,6 +362,7 @@ def calc_k_from_logk(x):
         return 10 ** v
     except Exception:
         return np.nan
+
 
 @st.cache_data(show_spinner=False)
 def load_data():
@@ -322,18 +381,19 @@ def load_data():
         df["_cas_norm"] = df["Cas"].map(norm_text).map(lambda x: x.replace(" ", ""))
         df["_rid"] = np.arange(1, len(df) + 1)
 
-        # 保留原始 Logk，同时新增 k
         df["Logk"] = pd.to_numeric(df["Logk"], errors="coerce")
         df["k"] = df["Logk"].map(calc_k_from_logk)
 
         out[system] = df
     return out
 
+
 def mol_from_smiles(smiles: str):
     s = str(smiles).strip()
     if s == "" or s.lower() in ["nan", "none", "unrecorded"]:
         return None
     return Chem.MolFromSmiles(s)
+
 
 def mol_to_pil_image(smiles: str, size=(320, 220)):
     mol = mol_from_smiles(smiles)
@@ -343,6 +403,7 @@ def mol_to_pil_image(smiles: str, size=(320, 220)):
         return Draw.MolToImage(mol, size=size)
     except Exception:
         return None
+
 
 DESCRIPTOR_FUNCS = {
     "MolWt": lambda m: float(Descriptors.MolWt(m)),
@@ -359,20 +420,25 @@ DESCRIPTOR_FUNCS = {
 }
 ALL_DESC_NAMES = list(DESCRIPTOR_FUNCS.keys())
 
+
 def compute_descriptors(smiles: str, selected: list[str]) -> dict:
     mol = mol_from_smiles(smiles)
     if mol is None:
         raise ValueError("SMILES cannot be parsed; descriptors unavailable.")
     return {k: float(DESCRIPTOR_FUNCS[k](mol)) for k in selected}
 
+
 def compute_morgan_bits(smiles: str, n_bits: int = 1024, radius: int = 2) -> list[int]:
     mol = mol_from_smiles(smiles)
     if mol is None:
         raise ValueError("SMILES cannot be parsed; Morgan unavailable.")
-    bv = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, int(radius), nBits=int(n_bits))
+
+    generator = rdFingerprintGenerator.GetMorganGenerator(radius=int(radius), fpSize=int(n_bits))
+    bv = generator.GetFingerprint(mol)
     arr = np.zeros((int(n_bits),), dtype=int)
-    Chem.DataStructs.ConvertToNumpyArray(bv, arr)
+    DataStructs.ConvertToNumpyArray(bv, arr)
     return arr.tolist()
+
 
 def compute_maccs_bits(smiles: str) -> list[int]:
     mol = mol_from_smiles(smiles)
@@ -380,8 +446,9 @@ def compute_maccs_bits(smiles: str) -> list[int]:
         raise ValueError("SMILES cannot be parsed; MACCS unavailable.")
     bv = MACCSkeys.GenMACCSKeys(mol)
     arr = np.zeros((bv.GetNumBits(),), dtype=int)
-    Chem.DataStructs.ConvertToNumpyArray(bv, arr)
+    DataStructs.ConvertToNumpyArray(bv, arr)
     return arr.tolist()
+
 
 def summarize_bits(bits: list[int]) -> dict:
     arr = np.array(bits, dtype=int)
@@ -391,31 +458,46 @@ def summarize_bits(bits: list[int]) -> dict:
         "on_ratio": float(arr.mean()),
     }
 
+
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
+
 def inc_query():
+    if not st.session_state.get("metrics_available", False):
+        return
     try:
         db_inc_metric("queries", 1)
     except Exception as e:
+        st.session_state["metrics_available"] = False
+        st.session_state["metrics_db_error"] = str(e)
         st.warning(f"Query counter update failed: {e}")
 
+
 def inc_download():
+    if not st.session_state.get("metrics_available", False):
+        return
     try:
         db_inc_metric("downloads", 1)
     except Exception as e:
+        st.session_state["metrics_available"] = False
+        st.session_state["metrics_db_error"] = str(e)
         st.warning(f"Download counter update failed: {e}")
+
 
 def cache_key(system: str, rid: int) -> str:
     return f"{system}__{rid}"
 
+
 def get_cache(system: str, rid: int) -> dict:
     return st.session_state["calc_cache"].get(cache_key(system, rid), {})
+
 
 def set_cache(system: str, rid: int, field: str, value):
     k = cache_key(system, rid)
     st.session_state["calc_cache"].setdefault(k, {})
     st.session_state["calc_cache"][k][field] = value
+
 
 def availability_summary(df: pd.DataFrame) -> dict:
     if df is None or len(df) == 0:
@@ -438,6 +520,7 @@ def availability_summary(df: pd.DataFrame) -> dict:
 
     return {"n": n, "class": class_top, "ph_range": ph_range, "t_range": t_range, "smiles_pct": smiles_pct, "ref_pct": ref_pct}
 
+
 def fmt_value(x, nd=6):
     if x is None:
         return "—"
@@ -454,6 +537,7 @@ def fmt_value(x, nd=6):
             return "—"
         return s
 
+
 def fmt_k_value(x):
     try:
         if x is None:
@@ -464,6 +548,7 @@ def fmt_k_value(x):
         return f"{v:.3e}"
     except Exception:
         return "—"
+
 
 # ===================== Load data =====================
 data_map = load_data()
@@ -570,6 +655,9 @@ with col_left:
         if st.session_state.get("dev_unlocked", False):
             try:
                 m = db_get_all_metrics()
+                st.session_state["metrics_available"] = True
+                st.session_state["metrics_db_error"] = ""
+
                 a, b, c = st.columns(3)
                 a.metric("Session visits", m.get("visits", 0))
                 b.metric("Search queries", m.get("queries", 0))
@@ -580,6 +668,8 @@ with col_left:
                     unsafe_allow_html=True
                 )
             except Exception as e:
+                st.session_state["metrics_available"] = False
+                st.session_state["metrics_db_error"] = str(e)
                 st.error(f"Failed to load metrics: {e}")
         else:
             st.markdown("<div class='small'>Locked. Metrics are hidden for non-developers.</div>", unsafe_allow_html=True)
@@ -606,12 +696,12 @@ with col_mid:
             s = availability_summary(res)
             st.markdown(
                 f"""
-<span class="pill">Records: <b>{s['n']}</b></span>
-<span class="pill">Class: <b>{s['class']}</b></span>
-<span class="pill">pH range: <b>{s['ph_range']}</b></span>
-<span class="pill">T range (°C): <b>{s['t_range']}</b></span>
-<span class="pill">SMILES available: <b>{s['smiles_pct']}</b></span>
-<span class="pill">Ref available: <b>{s['ref_pct']}</b></span>
+<span class="pill">Records: <b>{h(s['n'])}</b></span>
+<span class="pill">Class: <b>{h(s['class'])}</b></span>
+<span class="pill">pH range: <b>{h(s['ph_range'])}</b></span>
+<span class="pill">T range (°C): <b>{h(s['t_range'])}</b></span>
+<span class="pill">SMILES available: <b>{h(s['smiles_pct'])}</b></span>
+<span class="pill">Ref available: <b>{h(s['ref_pct'])}</b></span>
 """,
                 unsafe_allow_html=True,
             )
@@ -651,24 +741,25 @@ with col_mid:
 
                 struct_img = mol_to_pil_image(smiles, size=(320, 220))
                 if struct_img is not None:
-                    st.image(struct_img, caption="Molecular structure parsed from SMILES", use_container_width=False)
+                    st.image(struct_img, caption="Molecular structure parsed from SMILES", width=320)
 
                 def _ref_html(x: str) -> str:
                     if x and x.startswith("http"):
-                        return f"<a href='{x}' target='_blank'>{x}</a>"
-                    return x if x else "—"
+                        safe_url = h(x)
+                        return f"<a href='{safe_url}' target='_blank' rel='noopener noreferrer'>{safe_url}</a>"
+                    return h(x) if x else "—"
 
                 st.markdown(
                     f"""
-<div class="vbox"><div class="vtitle">Chemical</div><div class="vvalue">{name if name else "—"}</div></div>
-<div class="vbox"><div class="vtitle">CAS</div><div class="vvalue">{cas if cas else "—"}</div></div>
-<div class="vbox"><div class="vtitle">Logk</div><div class="vvalue">{logk}</div></div>
-<div class="vbox"><div class="vtitle">k (M⁻¹·s⁻¹)</div><div class="vvalue">{kval}</div></div>
-<div class="vbox"><div class="vtitle">Class</div><div class="vvalue">{cclass}</div></div>
-<div class="vbox"><div class="vtitle">pH</div><div class="vvalue">{ph}</div></div>
-<div class="vbox"><div class="vtitle">T (°C)</div><div class="vvalue">{t}</div></div>
+<div class="vbox"><div class="vtitle">Chemical</div><div class="vvalue">{h(name) if name else "—"}</div></div>
+<div class="vbox"><div class="vtitle">CAS</div><div class="vvalue">{h(cas) if cas else "—"}</div></div>
+<div class="vbox"><div class="vtitle">Logk</div><div class="vvalue">{h(logk)}</div></div>
+<div class="vbox"><div class="vtitle">k (M⁻¹·s⁻¹)</div><div class="vvalue">{h(kval)}</div></div>
+<div class="vbox"><div class="vtitle">Class</div><div class="vvalue">{h(cclass)}</div></div>
+<div class="vbox"><div class="vtitle">pH</div><div class="vvalue">{h(ph)}</div></div>
+<div class="vbox"><div class="vtitle">T (°C)</div><div class="vvalue">{h(t)}</div></div>
 <div class="vbox"><div class="vtitle">Ref</div><div class="vvalue">{_ref_html(ref)}</div></div>
-<div class="vbox"><div class="vtitle">SMILES</div><div class="vvalue">{smiles if smiles else "—"}</div></div>
+<div class="vbox"><div class="vtitle">SMILES</div><div class="vvalue">{h(smiles) if smiles else "—"}</div></div>
 """,
                     unsafe_allow_html=True,
                 )
@@ -725,7 +816,7 @@ with col_right:
                 for k in dvals.keys():
                     v = fmt_value(dvals[k], nd=6)
                     st.markdown(
-                        f"<div class='desc-box'><div class='desc-name'>{k}</div><div class='desc-val'>{v}</div></div>",
+                        f"<div class='desc-box'><div class='desc-name'>{h(k)}</div><div class='desc-val'>{h(v)}</div></div>",
                         unsafe_allow_html=True
                     )
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -794,7 +885,7 @@ with col_right:
                     unsafe_allow_html=True
                 )
 
-                st.markdown(f"<div class='mono-wrap'>{','.join(map(str, bits))}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='mono-wrap'>{h(','.join(map(str, bits)))}</div>", unsafe_allow_html=True)
 
                 nb = mpack["nBits"]
                 rad = mpack["radius"]
@@ -837,7 +928,7 @@ with col_right:
                     unsafe_allow_html=True
                 )
 
-                st.markdown(f"<div class='mono-wrap'>{','.join(map(str, bits))}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='mono-wrap'>{h(','.join(map(str, bits)))}</div>", unsafe_allow_html=True)
 
                 cols = [f"MACCS_{i}" for i in range(len(bits))]
                 out_df = pd.DataFrame(
